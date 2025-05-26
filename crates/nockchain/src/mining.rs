@@ -114,6 +114,7 @@ pub fn create_mining_driver(
             let mut next_attempt: Option<NounSlab> = None;
             let mut current_attempt: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             let num_cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+            let mining_cores = if num_cores > 2 { num_cores - 2 } else { 1 };
 
             loop {
                 tokio::select! {
@@ -136,7 +137,7 @@ pub fn create_mining_driver(
                             if !current_attempt.is_empty() {
                                 next_attempt = Some(candidate_slab);
                             } else {
-                                for _ in 0..num_cores {
+                                for _ in 0..mining_cores {
                                     let (cur_handle, attempt_handle) = handle.dup();
                                     handle = cur_handle;
                                     current_attempt.spawn(mining_attempt(candidate_slab.clone(), attempt_handle));
@@ -152,7 +153,7 @@ pub fn create_mining_driver(
                             continue;
                         };
                         next_attempt = None;
-                        for _ in 0..num_cores {
+                        for _ in 0..mining_cores {
                             let (cur_handle, attempt_handle) = handle.dup();
                             handle = cur_handle;
                             current_attempt.spawn(mining_attempt(candidate_slab.clone(), attempt_handle));

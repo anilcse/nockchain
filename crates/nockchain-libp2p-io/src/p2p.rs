@@ -22,51 +22,51 @@ use crate::nc::*;
 pub const KADEMLIA_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(300);
 
 /** How long we should keep a peer connection alive with no traffic */
-pub const SWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
 
 // Core protocol (QUIC/ping/etc) constants
 /** How many times we should retry dialing our initial peers if we can't get Kademlia initialized */
 // TODO: Make command-line configurable
 pub const INITIAL_PEER_RETRIES: u32 = 5;
 /** How often we should send a keep-alive message to a peer */
-pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /** How long should we wait before timing out the connection */
 pub const CONNECTION_TIMEOUT: Duration = SWARM_IDLE_TIMEOUT;
 /** How long should we wait before timing out the handshake */
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /** How long QUIC should wait before timing out an idle connection */
 pub const MAX_IDLE_TIMEOUT_MILLISECS: u32 = CONNECTION_TIMEOUT.as_millis() as u32;
 /** How often we should send an identify message to a peer */
 pub const IDENTIFY_INTERVAL: Duration = KADEMLIA_BOOTSTRAP_INTERVAL;
 
 /** Maximum number of established *incoming* connections */
-pub const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 32;
+pub const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 128;
 
 /** Maximum number of established *incoming* connections */
-pub const MAX_ESTABLISHED_OUTGOING_CONNECTIONS: u32 = 32;
+pub const MAX_ESTABLISHED_OUTGOING_CONNECTIONS: u32 = 128;
 
 /** Maximum number of established connections */
-pub const MAX_ESTABLISHED_CONNECTIONS: u32 = 64;
+pub const MAX_ESTABLISHED_CONNECTIONS: u32 = 512;
 
 /** Maximum number of established connections with a single peer ID */
-pub const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 2;
+pub const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
 /** Maximum pending incoming connections */
-pub const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 16;
+pub const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 126;
 
 /** Maximum pending outcoing connections */
-pub const MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 16;
+pub const MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 126;
 
 // Request/response constants
-pub const REQUEST_RESPONSE_MAX_CONCURRENT_STREAMS: usize = MAX_ESTABLISHED_CONNECTIONS as usize * 2;
-pub const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+pub const REQUEST_RESPONSE_MAX_CONCURRENT_STREAMS: usize = MAX_ESTABLISHED_CONNECTIONS as usize * 8;
+pub const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ALL PROTOCOLS MUST HAVE UNIQUE VERSIONS
 pub const REQ_RES_PROTOCOL_VERSION: &str = "/nockchain-1-req-res";
 pub const KAD_PROTOCOL_VERSION: &str = "/nockchain-1-kad";
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "/nockchain-1-identify";
 
-const PEER_STORE_RECORD_CAPACITY: usize = 10 * 1024;
+const PEER_STORE_RECORD_CAPACITY: usize = 100 * 1024;
 
 #[derive(Debug)]
 pub enum SwarmAction {

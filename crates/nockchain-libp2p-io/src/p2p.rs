@@ -59,7 +59,7 @@ pub const MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 126;
 
 // Request/response constants
 pub const REQUEST_RESPONSE_MAX_CONCURRENT_STREAMS: usize = MAX_ESTABLISHED_CONNECTIONS as usize * 8;
-pub const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ALL PROTOCOLS MUST HAVE UNIQUE VERSIONS
 pub const REQ_RES_PROTOCOL_VERSION: &str = "/nockchain-1-req-res";

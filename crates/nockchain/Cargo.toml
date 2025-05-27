@@ -38,6 +38,7 @@ tracing.workspace = true
 tracing-test.workspace = true
 
 zkvm-jetpack.workspace = true
+sys-info = "0.9.1"
 
 [build-dependencies]
 vergen = { workspace = true, features = [

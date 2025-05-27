@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use kernels::miner::KERNEL;
 use nockapp::kernel::checkpoint::JamPaths;
@@ -11,7 +12,7 @@ use nockapp::noun::{AtomExt, NounExt};
 use nockvm::noun::{Atom, D, T};
 use nockvm_macros::tas;
 use tempfile::tempdir;
-use tracing::{instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 pub enum MiningWire {
     Mined,
@@ -78,32 +79,41 @@ pub fn create_mining_driver(
 ) -> IODriverFn {
     Box::new(move |mut handle| {
         Box::pin(async move {
+            info!("Initializing mining driver with config: {:?}", mining_config);
+            
             let Some(configs) = mining_config else {
+                info!("No mining config provided, disabling mining");
                 enable_mining(&handle, false).await?;
 
                 if let Some(tx) = init_complete_tx {
                     tx.send(()).map_err(|_| {
-                        warn!("Could not send driver initialization for mining driver.");
+                        error!("Failed to send driver initialization for mining driver");
                         NockAppError::OtherError
                     })?;
                 }
 
                 return Ok(());
             };
+
+            // Configure mining keys
             if configs.len() == 1
                 && configs[0].share == 1
                 && configs[0].m == 1
                 && configs[0].keys.len() == 1
             {
+                info!("Setting single mining key");
                 set_mining_key(&handle, configs[0].keys[0].clone()).await?;
             } else {
+                info!("Setting advanced mining keys configuration");
                 set_mining_key_advanced(&handle, configs).await?;
             }
+
             enable_mining(&handle, mine).await?;
+            info!("Mining enabled: {}", mine);
 
             if let Some(tx) = init_complete_tx {
                 tx.send(()).map_err(|_| {
-                    warn!("Could not send driver initialization for mining driver.");
+                    error!("Failed to send driver initialization for mining driver");
                     NockAppError::OtherError
                 })?;
             }
@@ -111,51 +121,79 @@ pub fn create_mining_driver(
             if !mine {
                 return Ok(());
             }
+
             let mut next_attempt: Option<NounSlab> = None;
             let mut current_attempt: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            
+            // Limit mining cores to prevent resource exhaustion
             let num_cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-            let mining_cores = if num_cores > 2 { num_cores - 2 } else { 1 };
+            let mining_cores = if num_cores > 4 { 2 } else { 1 }; // Limit to max 2 cores
+            info!("Using {} mining cores", mining_cores);
+
+            // Add resource monitoring
+            let mut last_resource_check = std::time::Instant::now();
+            let resource_check_interval = Duration::from_secs(30);
 
             loop {
+                // Check system resources periodically
+                if last_resource_check.elapsed() >= resource_check_interval {
+                    if let Err(e) = check_system_resources() {
+                        error!("System resource check failed: {}", e);
+                        // Optionally pause mining or reduce cores
+                    }
+                    last_resource_check = std::time::Instant::now();
+                }
+
                 tokio::select! {
                     effect_res = handle.next_effect() => {
                         let Ok(effect) = effect_res else {
-                          warn!("Error receiving effect in mining driver: {effect_res:?}");
-                        continue;
+                            error!("Error receiving effect in mining driver: {:?}", effect_res);
+                            continue;
                         };
+                        
                         let Ok(effect_cell) = (unsafe { effect.root().as_cell() }) else {
+                            warn!("Invalid effect cell received");
                             drop(effect);
                             continue;
                         };
 
                         if effect_cell.head().eq_bytes("mine") {
+                            info!("Received new mining candidate");
                             let candidate_slab = {
                                 let mut slab = NounSlab::new();
                                 slab.copy_into(effect_cell.tail());
                                 slab
                             };
+                            
                             if !current_attempt.is_empty() {
+                                info!("Queuing next mining attempt");
                                 next_attempt = Some(candidate_slab);
                             } else {
-                                for _ in 0..mining_cores {
+                                for i in 0..mining_cores {
                                     let (cur_handle, attempt_handle) = handle.dup();
                                     handle = cur_handle;
+                                    info!("Spawning mining attempt {}", i + 1);
                                     current_attempt.spawn(mining_attempt(candidate_slab.clone(), attempt_handle));
                                 }
                             }
                         }
                     },
-                    mining_attempt_res = current_attempt.join_next(), if !current_attempt.is_empty()  => {
-                        if let Some(Err(e)) = mining_attempt_res {
-                            warn!("Error during mining attempt: {e:?}");
+                    mining_attempt_res = current_attempt.join_next(), if !current_attempt.is_empty() => {
+                        match mining_attempt_res {
+                            Some(Ok(())) => info!("Mining attempt completed successfully"),
+                            Some(Err(e)) => error!("Error during mining attempt: {:?}", e),
+                            None => warn!("Mining attempt completed with no result"),
                         }
+
                         let Some(candidate_slab) = next_attempt else {
                             continue;
                         };
                         next_attempt = None;
-                        for _ in 0..mining_cores {
+                        
+                        for i in 0..mining_cores {
                             let (cur_handle, attempt_handle) = handle.dup();
                             handle = cur_handle;
+                            info!("Spawning next mining attempt {}", i + 1);
                             current_attempt.spawn(mining_attempt(candidate_slab.clone(), attempt_handle));
                         }
                     }
@@ -165,35 +203,87 @@ pub fn create_mining_driver(
     })
 }
 
+#[instrument(skip(candidate, handle))]
 pub async fn mining_attempt(candidate: NounSlab, handle: NockAppHandle) -> () {
-    let snapshot_dir =
-        tokio::task::spawn_blocking(|| tempdir().expect("Failed to create temporary directory"))
-            .await
-            .expect("Failed to create temporary directory");
+    info!("Starting mining attempt");
+    
+    let snapshot_dir = match tokio::task::spawn_blocking(|| tempdir()).await {
+        Ok(Ok(dir)) => dir,
+        Ok(Err(e)) => {
+            error!("Failed to create temporary directory: {}", e);
+            return;
+        }
+        Err(e) => {
+            error!("Failed to spawn blocking task for tempdir: {}", e);
+            return;
+        }
+    };
+
     let hot_state = zkvm_jetpack::hot::produce_prover_hot_state();
     let snapshot_path_buf = snapshot_dir.path().to_path_buf();
     let jam_paths = JamPaths::new(snapshot_dir.path());
-    // Spawns a new std::thread for this mining attempt
-    let kernel =
+
+    // Load kernel with timeout
+    let kernel = match tokio::time::timeout(
+        Duration::from_secs(30),
         Kernel::load_with_hot_state_huge(snapshot_path_buf, jam_paths, KERNEL, &hot_state, false)
-            .await
-            .expect("Could not load mining kernel");
-    let effects_slab = kernel
-        .poke(MiningWire::Candidate.to_wire(), candidate)
-        .await
-        .expect("Could not poke mining kernel with candidate");
+    ).await {
+        Ok(Ok(kernel)) => kernel,
+        Ok(Err(e)) => {
+            error!("Failed to load mining kernel: {}", e);
+            return;
+        }
+        Err(_) => {
+            error!("Timeout while loading mining kernel");
+            return;
+        }
+    };
+
+    info!("Mining kernel loaded successfully");
+
+    let effects_slab = match kernel.poke(MiningWire::Candidate.to_wire(), candidate).await {
+        Ok(slab) => slab,
+        Err(e) => {
+            error!("Failed to poke mining kernel with candidate: {}", e);
+            return;
+        }
+    };
+
     for effect in effects_slab.to_vec() {
         let Ok(effect_cell) = (unsafe { effect.root().as_cell() }) else {
+            warn!("Invalid effect cell in mining attempt");
             drop(effect);
             continue;
         };
+
         if effect_cell.head().eq_bytes("command") {
-            handle
-                .poke(MiningWire::Mined.to_wire(), effect)
-                .await
-                .expect("Could not poke nockchain with mined PoW");
+            if let Err(e) = handle.poke(MiningWire::Mined.to_wire(), effect).await {
+                error!("Failed to poke nockchain with mined PoW: {}", e);
+            } else {
+                info!("Successfully submitted mined PoW");
+            }
         }
     }
+}
+
+// Add a function to check system resources
+fn check_system_resources() -> Result<(), String> {
+    // Get system memory info
+    let mem_info = sys_info::mem_info().map_err(|e| format!("Failed to get memory info: {}", e))?;
+    let total_mem = mem_info.total;
+    let free_mem = mem_info.free;
+    let used_percent = ((total_mem - free_mem) as f64 / total_mem as f64) * 100.0;
+
+    // Log memory usage
+    info!("Memory usage: {:.1}% used ({} MB free of {} MB total)", 
+          used_percent, free_mem / 1024 / 1024, total_mem / 1024 / 1024);
+
+    // Warn if memory usage is high
+    if used_percent > 90.0 {
+        warn!("High memory usage detected: {:.1}%", used_percent);
+    }
+
+    Ok(())
 }
 
 #[instrument(skip(handle, pubkey))]

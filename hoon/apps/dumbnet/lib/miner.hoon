@@ -63,6 +63,77 @@
   ~>  %slog.[0 [%leaf print-var]]
   m
 ::
+::  +tx-pool: manages pending transactions
+++  tx-pool
+  |_  [pool=(z-map hash:t raw-tx:t) fees=(z-map hash:t coins:t)]
+  ++  add
+    |=  [raw=raw-tx:t fee=coins:t]
+    ^-  (pair (z-map hash:t raw-tx:t) (z-map hash:t coins:t))
+    ::
+    ::  Add transaction to pool if it has higher fees than existing one
+    ::
+    =/  id=hash:t  id.raw
+    ?:  (~(has z-by fees) id)
+      ?:  (gth fee (~(get z-by fees) id))
+        ::
+        ::  Replace with higher fee transaction
+        ::
+        [(~(put z-by pool) id raw) (~(put z-by fees) id fee)]
+      [pool fees]
+    ::
+    ::  Add new transaction
+    ::
+    [(~(put z-by pool) id raw) (~(put z-by fees) id fee)]
+  ++  remove
+    |=  id=hash:t
+    ^-  (pair (z-map hash:t raw-tx:t) (z-map hash:t coins:t))
+    [(~(del z-by pool) id) (~(del z-by fees) id)]
+  ++  get-highest-fee
+    |=  n=@
+    ^-  (list [hash:t raw-tx:t])
+    ::
+    ::  Get top N transactions by fee
+    ::
+    =/  sorted=(list [hash:t coins:t])
+      %+  sort  ~(tap z-by fees)
+      |=  [[id1=hash:t fee1=coins:t] [id2=hash:t fee2=coins:t]]
+      (gth fee1 fee2)
+    =/  top-n=(list hash:t)
+      %+  turn  (scag n sorted)
+      |=  [id=hash:t fee=coins:t]
+      id
+    %+  turn  top-n
+    |=  id=hash:t
+    [id (~(get z-by pool) id)]
+  --
+
+::  +process-tx-batch: process a batch of transactions
+++  process-tx-batch
+  |=  [raws=(list raw-tx:t) min=_m]
+  ^-  mining-state:dk
+  ::
+  ::  Process transactions in batches for better performance
+  ::
+  =/  pool=tx-pool  [*(z-map hash:t raw-tx:t) *(z-map hash:t coins:t)]
+  =/  new-min=_m  min
+  ::
+  ::  Add all transactions to pool
+  ::
+  =/  pool  %+  roll  raws
+    |=  [raw=raw-tx:t p=tx-pool]
+    (add:tx-pool p raw (fee:raw-tx:t raw))
+  ::
+  ::  Process highest fee transactions first
+  ::
+  =/  to-process=(list [hash:t raw-tx:t])
+    (get-highest-fee:tx-pool pool 100)  :: Process up to 100 transactions
+  ::
+  ::  Process each transaction
+  ::
+  %+  roll  to-process
+  |=  [[id=hash:t raw=raw-tx:t] min=_m]
+  (heard-new-tx raw)
+
 ::  +heard-new-tx: potentially changes candidate block in reaction to a raw-tx
 ++  heard-new-tx
   |=  raw=raw-tx:t
@@ -72,6 +143,7 @@
   ::
   ::  if the mining pubkey is not set, do nothing
   ?:  =(*(z-set lock:t) pubkeys.m)  m
+  ::
   ::  check to see if block is valid with tx - this checks whether the inputs
   ::  exist, whether the new size will exceed block size, and whether timelocks
   ::  are valid
@@ -83,27 +155,31 @@
   =/  new-acc=(unit tx-acc:t)
     (process:tx-acc:t candidate-acc.m u.tx height.candidate-block.m)
   ?~  new-acc
-    ::~&  >>>  """
-    ::         tx {(trip (to-b58:hash:t id.raw))} cannot be added to candidate
-    ::         block.
-    ::         """
     m
+  ::
   ::  we can add tx to candidate-block
+  ::
   =.  tx-ids.candidate-block.m
     (~(put z-in tx-ids.candidate-block.m) id.raw)
   =/  old-fees=coins:t  fees.candidate-acc.m
   =.  candidate-acc.m  u.new-acc
   =/  new-fees=coins:t  fees.candidate-acc.m
+  ::
   ::  check if new-fees != old-fees to determine if split should be recalculated.
   ::  since we don't have replace-by-fee
+  ::
   ?:  =(new-fees old-fees)
     ::  fees are equal so no need to recalculate split
     m
+  ::
   ::  fees are unequal. for this miner, fees are only ever monotonically
   ::  incremented and so this assertion should never fail.
+  ::
   ?>  (gth new-fees old-fees)
   =/  fee-diff=coins:t  (sub new-fees old-fees)
+  ::
   ::  compute old emission+fees
+  ::
   =/  old-assets=coins:t
     %+  roll  ~(val z-by coinbase.candidate-block.m)
     |=  [c=coins:t sum=coins:t]
@@ -113,21 +189,70 @@
     (new:coinbase-split:t new-assets shares.m)
   m
 ::
-::  +heard-new-block: refreshes the candidate block to be mined in reaction to a new block
-::
-::    when we hear a new heaviest block, we need to update the candidate we're attempting
-::    to mine. that means we should update the parent and page number of the block, and carry
-::    over any transactions we had previously been attempting to include that werent
-::    included in the most recent block.
+::  +block-template: pre-computed block template
+++  block-template
+  |_  [template=page:t timestamp=@]
+  ++  update-timestamp
+    |=  now=@da
+    ^-  block-template
+    ?:  %+  gte  timestamp
+        (time-in-secs:page:t (sub now update-candidate-timestamp-interval:t))
+      [template timestamp]
+    [template (time-in-secs:page:t now)]
+  --
+
+::  +optimize-candidate: optimize block candidate with better transaction selection
+++  optimize-candidate
+  |=  [candidate=page:t txs=(list raw-tx:t)]
+  ^-  page:t
+  ::
+  ::  Sort transactions by fee per byte
+  ::
+  =/  fee-per-byte=(list [raw-tx:t @])
+    %+  turn  txs
+    |=  raw=raw-tx:t
+    =/  size=@  (size:raw-tx:t raw)
+    =/  fee=@  (fee:raw-tx:t raw)
+    [raw (div fee size)]
+  =/  sorted-txs=(list raw-tx:t)
+    %+  turn  (sort fee-per-byte |= [[a=raw-tx:t b=@] [c=raw-tx:t d=@]] (gth b d))
+    |=  [raw=raw-tx:t fee=@]
+    raw
+  ::
+  ::  Fill block with highest fee-per-byte transactions
+  ::
+  =/  new-candidate=page:t  candidate
+  =/  current-size=@  0
+  =/  max-size=@  max-block-size
+  ::
+  ::  Add transactions until block is full
+  ::
+  %+  roll  sorted-txs
+  |=  [raw=raw-tx:t candidate=page:t]
+  =/  size=@  (size:raw-tx:t raw)
+  ?:  (gth (add current-size size) max-size)
+    candidate
+  =/  tx=(unit tx:t)  (mole |.((new:tx:t raw height.candidate)))
+  ?~  tx  candidate
+  =/  new-acc=(unit tx-acc:t)
+    (process:tx-acc:t candidate-acc.candidate u.tx height.candidate)
+  ?~  new-acc  candidate
+  ::
+  ::  Update candidate with new transaction
+  ::
+  =.  tx-ids.candidate  (~(put z-in tx-ids.candidate) id.raw)
+  =.  candidate-acc.candidate  u.new-acc
+  =.  current-size  (add current-size size)
+  candidate
+
+::  +heard-new-block: optimized block candidate generation
 ++  heard-new-block
   |=  [c=consensus-state:dk p=pending-state:dk now=@da]
   ^-  mining-state:dk
   ::
-  ::  do a sanity check that we have a heaviest block, and that the heaviest block
-  ::  is not the parent of our current candidate block
+  ::  Sanity checks
+  ::
   ?~  heaviest-block.c
-    ::  genesis block has its own codepath, which is why this conditional does not attempt
-    ::  to generate the genesis block
     ~>  %slog.[0 leaf+"attempted to generate new candidate block when we have no genesis block"]
     m
   ?:  =(u.heaviest-block.c parent.candidate-block.m)
@@ -136,25 +261,22 @@
   ?:  =(*(z-set lock:t) pubkeys.m)
     ~>  %slog.[0 leaf+"no pubkey(s) set so no new candidate block will be generated"]
     m
-  =/  print-var
-    %-  trip
-    ^-  @t
-    %^  cat  3
-      'generating new candidate block with parent: '
-    (to-b58:hash:t u.heaviest-block.c)
-  ~>  %slog.[0 [%leaf print-var]]
-  =.  candidate-block.m
+  ::
+  ::  Generate optimized candidate block
+  ::
+  =/  base-candidate=page:t
     %-  new-candidate:page:t
     :*  (to-page:local-page:t (~(got z-by blocks.c) u.heaviest-block.c))
         now
         (~(got z-by targets.c) u.heaviest-block.c)
         shares.m
     ==
+  =/  optimized-candidate=page:t
+    (optimize-candidate base-candidate ~(val z-by raw-txs.p))
+  ::
+  ::  Update mining state
+  ::
+  =.  candidate-block.m  optimized-candidate
   =.  candidate-acc.m
     (new:tx-acc:t (~(get z-by balance.c) u.heaviest-block.c))
-  ::
-  ::  roll over the pending txs and try to include them in the new candidate block
-  %+  roll  ~(val z-by raw-txs.p)
-  |=  [raw=raw-tx:t min=_m]
-  (heard-new-tx raw)
---
+  m
